@@ -214,7 +214,7 @@ async def listen_once(seconds):
     seen, static_new = {}, {}
     loop = asyncio.get_running_loop()
     deadline = loop.time() + seconds
-    async with websockets.connect(AIS_URL, open_timeout=20) as ws:
+    async with websockets.connect(AIS_URL, open_timeout=60) as ws:
         await ws.send(json.dumps(subscription()))  # отправить сразу после подключения
         while (left := deadline - loop.time()) > 0:
             try:
@@ -333,9 +333,17 @@ def flush(state, seen, static_new, run_time):
 
 # ---------------- режимы ----------------
 
-def run_once():
+def run_once(attempts=4, pause=20):
     state = load_state()
-    seen, static_new = asyncio.run(listen_once(LISTEN_SECONDS))
+    for i in range(1, attempts + 1):
+        try:
+            seen, static_new = asyncio.run(listen_once(LISTEN_SECONDS))
+            break
+        except Exception as e:
+            if "aisstream:" in str(e) or i == attempts:  # ошибку ключа повторять бессмысленно
+                raise
+            log(f"Попытка {i} не удалась ({e}). Повтор через {pause} с.")
+            time.sleep(pause)
     flush(state, seen, static_new, now_local())
 
 
@@ -348,7 +356,7 @@ async def run_daemon():
     log("Непрерывный режим запущен.")
     while True:
         try:
-            async with websockets.connect(AIS_URL, open_timeout=20,
+            async with websockets.connect(AIS_URL, open_timeout=60,
                                           ping_interval=30) as ws:
                 await ws.send(json.dumps(subscription()))
                 log("Подключено к aisstream.io")
