@@ -1,14 +1,22 @@
-# GitHub Actions: запуск каждые 30 минут на серверах GitHub (бесплатно для публичного репозитория).
+# GitHub Actions: сбор судов по расписанию.
 # Положите этот файл в репозиторий по пути .github/workflows/ships.yml
 name: Суда в зоне
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # время UTC; GitHub может задерживать запуск на 5-20 минут
+    - cron: "37 5 * * *"     # раз в сутки, 05:37 UTC (07:37 по Калининграду)
   workflow_dispatch:          # кнопка ручного запуска во вкладке Actions
     inputs:
+      source:
+        description: "Источник: gfw (Global Fishing Watch), mst (MyShipTracking), aisstream"
+        required: false
+        default: "gfw"
+      days:
+        description: "GFW: за сколько дней загрузить заходы (для первой загрузки истории можно 90)"
+        required: false
+        default: "14"
       area:
-        description: "Проверочная область (пусто = Калининград). Пример всей Балтики: 53.5,9.5,66,30.5"
+        description: "Проверочная область (пусто = Калининград). Формат: шир1,долг1,шир2,долг2"
         required: false
         default: ""
 
@@ -31,7 +39,12 @@ jobs:
       - run: pip install websockets
       - name: Сбор данных
         env:
+          SOURCE: ${{ inputs.source || 'gfw' }}
+          GFW_API_KEY: ${{ secrets.GFW_API_KEY }}
+          GFW_LOOKBACK_DAYS: ${{ inputs.days || '14' }}
+          MST_API_KEY: ${{ secrets.MST_API_KEY }}
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
+          INTERVAL_MINUTES: "180"
           AREA: ${{ inputs.area }}
           # проверочные запуски пишут в отдельную папку, чтобы не смешивать с рабочими данными
           DATA_DIR: ${{ inputs.area != '' && 'data_test' || 'data' }}
