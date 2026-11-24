@@ -2,7 +2,12 @@
 """
 Суда в заданной акватории -> таблицы CSV (открываются в Excel).
 
-Источник: aisstream.io (бесплатный AIS-поток по WebSocket).
+Источники (переменная SOURCE):
+  gfw        Global Fishing Watch — заходы в порты/на якорные стоянки, бесплатно
+             для некоммерческого использования, данные с задержкой ~3 суток
+             (таблица port_visits.csv)
+  mst        MyShipTracking API — запрос «суда в зоне» (по умолчанию; видит Калининград)
+  aisstream  aisstream.io — бесплатный поток (в районе Калининграда покрытия нет)
 
 Два режима:
   python ships_in_zone.py           разовый запуск: слушает LISTEN_SECONDS и
@@ -28,8 +33,25 @@ from datetime import datetime, timezone, timedelta
 
 # ======================= НАСТРОЙКИ =======================
 
-# Ключ aisstream.io. Лучше задавать переменной окружения AISSTREAM_API_KEY.
-API_KEY = os.environ.get("AISSTREAM_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_СЮДА")
+# Источник данных: "gfw" (Global Fishing Watch), "mst" (MyShipTracking) или "aisstream".
+SOURCE = os.environ.get("SOURCE", "gfw").strip().lower() or "gfw"
+
+# Ключи. Лучше задавать переменными окружения (в GitHub — секретами).
+API_KEY = os.environ.get("AISSTREAM_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_СЮДА")   # aisstream.io
+MST_API_KEY = os.environ.get("MST_API_KEY", "")                         # MyShipTracking
+GFW_API_KEY = os.environ.get("GFW_API_KEY", "")                         # Global Fishing Watch
+
+# Global Fishing Watch: за сколько последних дней перезапрашивать заходы при каждом
+# запуске (данные приходят с задержкой ~3 суток, поэтому окно с запасом).
+GFW_LOOKBACK_DAYS = int(os.environ.get("GFW_LOOKBACK_DAYS", 14))
+
+# Как часто запускается скрипт, минут. Для MyShipTracking это же окно «свежести»:
+# берутся суда, чья последняя позиция в зоне не старше этого числа минут.
+INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", 180))
+
+# MyShipTracking: "simple" = 1 монета за судно; "extended" = 3 монеты, но с
+# пунктом назначения, флагом, портами, дедвейтом и т.д.
+MST_RESPONSE = os.environ.get("MST_RESPONSE", "simple").strip() or "simple"
 
 # Общая область подписки: [[широта, долгота], [широта, долгота]] — два угла.
 # Калининградская область: от Балтийской косы до Куршской косы, с подходами.
@@ -56,7 +78,8 @@ OTHER_ZONE = "Балтийское море (акватория)"
 
 LISTEN_SECONDS = int(os.environ.get("LISTEN_SECONDS", 240))  # разовый режим
 FLUSH_MINUTES = 10           # режим --daemon: как часто записывать таблицы
-EXIT_AFTER_MINUTES = 90      # сколько минут без сигнала = судно ушло из зоны
+# Сколько минут без сигнала = судно ушло из зоны (два пропущенных запуска + запас).
+EXIT_AFTER_MINUTES = max(90, INTERVAL_MINUTES * 2 + 30)
 TZ_OFFSET_HOURS = 2          # время в таблицах: 2 = Калининград (UTC+2)
 CSV_DELIMITER = ";"          # ';' — чтобы русский Excel сразу разбил по столбцам
 SPOOF_SPEED_KNOTS = 50       # скачок быстрее этого = подозрительная позиция
@@ -126,6 +149,16 @@ def ship_type_name(code):
     groups = {2: "Экраноплан", 4: "Скоростное", 6: "Пассажирское",
               7: "Грузовое", 8: "Танкер", 9: "Прочее"}
     return groups.get(code // 10, f"Код {code}")
+
+
+def type_of(s):
+    if s.get("type_text"):
+        return s["type_text"]
+    if s.get("type"):
+        return ship_type_name(s["type"])
+    if s.get("vtype") not in (None, ""):
+        return f"Группа {s['vtype']}"
+    return ""
 
 
 def in_box(lat, lon, box):
@@ -237,6 +270,202 @@ async def listen_once(seconds):
     return seen, static_new
 
 
+# ---------------- MyShipTracking ----------------
+
+MST_URL = "https://api.myshiptracking.com/api/v2/vessel/zone"
+MST_NAV = {  # в ответе MyShipTracking статус приходит числом (как в AIS)
+    **NAV_STATUS, 15: "",
+}
+
+
+def mst_request(minutes_back):
+    import urllib.request, urllib.parse, urllib.error
+    (a, b), (c, d) = MAIN_AREA
+    q = urllib.parse.urlencode({
+        "minlat": min(a, c), "maxlat": max(a, c),
+        "minlon": min(b, d), "maxlon": max(b, d),
+        "response": MST_RESPONSE, "minutesBack": minutes_back,
+    })
+    req = urllib.request.Request(f"{MST_URL}?{q}", headers={
+        "Authorization": f"Bearer {MST_API_KEY}", "Accept": "application/json",
+        "User-Agent": "ships-in-zone/1.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            body, charged = json.loads(r.read().decode("utf-8")), r.headers.get("X-Credit-Charged")
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            raise RuntimeError(f"MyShipTracking: HTTP {e.code}")
+        charged = None
+    if body.get("status") != "success":
+        raise RuntimeError(f"MyShipTracking: {body.get('code')} {body.get('message')}")
+    return body.get("data") or [], charged
+
+
+def fetch_mst():
+    try:
+        data, charged = mst_request(INTERVAL_MINUTES)
+    except RuntimeError as e:
+        if "ERR_TRIAL_LIMIT" not in str(e) or INTERVAL_MINUTES <= 60:
+            raise
+        log(f"Пробный ключ не даёт окно {INTERVAL_MINUTES} мин, беру 60 мин.")
+        data, charged = mst_request(60)
+    seen, static_new = {}, {}
+    for v in data:
+        mmsi = str(v.get("mmsi") or "")
+        lat, lon = v.get("lat"), v.get("lng")
+        if not mmsi or lat is None or lon is None:
+            continue
+        ns = v.get("nav_status")
+        try:
+            status = MST_NAV.get(int(ns), "")
+        except (TypeError, ValueError):
+            status = str(ns or "")
+        seen[mmsi] = {
+            "lat": round(float(lat), 5), "lon": round(float(lon), 5),
+            "sog": v.get("speed", ""), "cog": v.get("course", ""), "status": status,
+            "time": str(v.get("received") or "")[:19].replace("T", " "),
+            "name": clean(v.get("vessel_name")),
+        }
+        st = {"name": clean(v.get("vessel_name")),
+              "imo": str(v["imo"]) if v.get("imo") else ""}
+        if v.get("ais_type"):
+            st["type"] = v.get("ais_type")
+        elif v.get("vtype") is not None:
+            st["vtype"] = v.get("vtype")
+        if v.get("vessel_type"):
+            st["type_text"] = clean(v.get("vessel_type"))
+        for k_src, k_dst in (("callsign", "callsign"), ("destination", "destination"),
+                             ("flag", "flag")):
+            if v.get(k_src):
+                st[k_dst] = clean(str(v[k_src]))
+        if v.get("size_a") is not None and v.get("size_b") is not None:
+            st["length"] = (v.get("size_a") or 0) + (v.get("size_b") or 0) or ""
+        static_new[mmsi] = st
+    log(f"MyShipTracking: судов в ответе {len(seen)}, списано монет: {charged or 'н/д'}")
+    return seen, static_new
+
+
+# ---------------- Global Fishing Watch ----------------
+
+GFW_URL = "https://gateway.api.globalfishingwatch.org/v3/events"
+PORT_VISITS_FILE = os.path.join(DATA_DIR, "port_visits.csv")
+PV_COLUMNS = [
+    "Начало захода", "Окончание", "Длительность, ч", "Название", "MMSI", "Флаг",
+    "Тип судна", "Место (якорная стоянка / порт)", "У причала", "Зона",
+    "Широта", "Долгота", "Достоверность (2-4)", "ID события",
+]
+GFW_TYPES = {
+    "CARGO": "Грузовое", "TANKER": "Танкер", "FISHING": "Рыболовное",
+    "PASSENGER": "Пассажирское", "CARRIER": "Рефрижератор/перевозчик",
+    "SUPPORT": "Вспомогательное", "BUNKER": "Бункеровщик", "GEAR": "Орудие лова",
+    "SEISMIC_VESSEL": "Сейсморазведка", "OTHER": "Прочее", "DISCREPANCY": "Не определён",
+}
+ISO3 = {
+    "RUS": "Россия", "POL": "Польша", "LTU": "Литва", "LVA": "Латвия", "EST": "Эстония",
+    "FIN": "Финляндия", "SWE": "Швеция", "DNK": "Дания", "DEU": "Германия",
+    "NLD": "Нидерланды", "NOR": "Норвегия", "CYP": "Кипр", "MLT": "Мальта",
+    "LBR": "Либерия", "PAN": "Панама", "MHL": "Маршалловы о-ва", "ATG": "Антигуа и Барбуда",
+    "COM": "Коморы", "GAB": "Габон", "CMR": "Камерун", "PLW": "Палау", "TUV": "Тувалу",
+    "TZA": "Танзания", "TGO": "Того", "SLE": "Сьерра-Леоне", "BLZ": "Белиз",
+    "MNG": "Монголия", "TUR": "Турция", "GRC": "Греция", "GBR": "Великобритания",
+    "HKG": "Гонконг", "SGP": "Сингапур", "CHN": "Китай", "ARE": "ОАЭ", "IRN": "Иран",
+    "KNA": "Сент-Китс и Невис", "BRB": "Барбадос", "VCT": "Сент-Винсент и Гренадины",
+}
+
+
+def gfw_page(start, end, offset, limit=100):
+    import urllib.request, urllib.error
+    (a, b), (c, d) = MAIN_AREA
+    lat1, lat2, lon1, lon2 = min(a, c), max(a, c), min(b, d), max(b, d)
+    body = {
+        "datasets": ["public-global-port-visits-events:latest"],
+        "startDate": start, "endDate": end,
+        "geometry": {"type": "Polygon", "coordinates": [[
+            [lon1, lat1], [lon2, lat1], [lon2, lat2], [lon1, lat2], [lon1, lat1]]]},
+    }
+    req = urllib.request.Request(
+        f"{GFW_URL}?offset={offset}&limit={limit}",
+        data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Authorization": f"Bearer {GFW_API_KEY}",
+                 "Content-Type": "application/json", "User-Agent": "ships-in-zone/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"Global Fishing Watch: HTTP {e.code} {text}")
+
+
+def gfw_time(iso):
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.astimezone(LOCAL_TZ).strftime(TFMT)
+    except ValueError:
+        return iso[:16]
+
+
+def run_gfw():
+    state = load_state()
+    events = state.setdefault("gfw_events", {})
+    today = datetime.now(timezone.utc).date()
+    start = (today - timedelta(days=GFW_LOOKBACK_DAYS)).isoformat()
+    end = (today + timedelta(days=1)).isoformat()      # конец не включается
+    offset, got, new = 0, 0, 0
+    while True:
+        page = gfw_page(start, end, offset)
+        entries = page.get("entries") or []
+        for e in entries:
+            pv = e.get("port_visit") or {}
+            anc = pv.get("intermediateAnchorage") or pv.get("startAnchorage") or {}
+            v = e.get("vessel") or {}
+            pos = e.get("position") or {}
+            lat = anc.get("lat", pos.get("lat"))
+            lon = anc.get("lon", pos.get("lon"))
+            try:
+                lat, lon = round(float(lat), 5), round(float(lon), 5)
+            except (TypeError, ValueError):
+                lat = lon = ""
+            place = anc.get("name") or anc.get("topDestination") or ""
+            top = anc.get("topDestination") or ""
+            if top and place and top != place:
+                place = f"{place} ({top})"
+            eid = e.get("id")
+            if eid not in events:
+                new += 1
+            events[eid] = {
+                "start": gfw_time(e.get("start")), "end": gfw_time(e.get("end")),
+                "hours": round(pv.get("durationHrs") or 0, 1),
+                "name": clean(v.get("name")), "mmsi": str(v.get("ssvid") or ""),
+                "flag": ISO3.get(v.get("flag") or "", v.get("flag") or ""),
+                "type": GFW_TYPES.get(str(v.get("type") or "").upper(), v.get("type") or ""),
+                "place": place, "dock": "да" if anc.get("atDock") else "",
+                "zone": zone_of(lat, lon) if lat != "" else "",
+                "lat": lat, "lon": lon, "conf": pv.get("confidence", ""),
+            }
+        got += len(entries)
+        nxt = page.get("nextOffset")
+        if not entries or nxt is None or nxt <= offset or got >= (page.get("total") or 0):
+            break
+        offset = nxt
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(PORT_VISITS_FILE, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=CSV_DELIMITER)
+        w.writerow(PV_COLUMNS)
+        for eid, r in sorted(events.items(), key=lambda x: x[1]["start"], reverse=True):
+            w.writerow([r["start"], r["end"], r["hours"], r["name"], r["mmsi"], r["flag"],
+                        r["type"], r["place"], r["dock"], r["zone"], r["lat"], r["lon"],
+                        r["conf"], eid])
+    save_state(state)
+    log(f"Global Fishing Watch: заходов за {GFW_LOOKBACK_DAYS} дн. — {got}, новых — {new}, "
+        f"всего в таблице — {len(events)}.")
+
+
 # ---------------- состояние и таблицы ----------------
 
 def load_state():
@@ -291,8 +520,8 @@ def flush(state, seen, static_new, run_time):
         notes[mmsi] = note
         rows.append([
             t, mmsi, r.get("name") or s.get("name", ""), s.get("imo", ""),
-            s.get("callsign", ""), ship_type_name(s.get("type")),
-            MID.get(mmsi[:3], ""), zone, r["lat"], r["lon"], r.get("sog", ""),
+            s.get("callsign", ""), type_of(s),
+            s.get("flag") or MID.get(mmsi[:3], ""), zone, r["lat"], r["lon"], r.get("sog", ""),
             r.get("cog", ""), r.get("status", ""), s.get("destination", ""),
             s.get("length", ""), r.get("time", ""), note,
         ])
@@ -331,7 +560,7 @@ def flush(state, seen, static_new, run_time):
         for v in sorted(state["visits"], key=lambda v: v["enter"], reverse=True):
             s = static.get(v["mmsi"], {})
             w.writerow([
-                v["mmsi"], s.get("name", ""), s.get("imo", ""), ship_type_name(s.get("type")),
+                v["mmsi"], s.get("name", ""), s.get("imo", ""), type_of(s),
                 s.get("destination", ""), v.get("zone_in", ""), v.get("zone_last", ""),
                 v["enter"], v["last"], v["exit"], "" if v["exit"] else "да", v.get("note", ""),
             ])
@@ -344,6 +573,10 @@ def flush(state, seen, static_new, run_time):
 
 def run_once(attempts=4, pause=20):
     state = load_state()
+    if SOURCE == "mst":
+        seen, static_new = fetch_mst()
+        flush(state, seen, static_new, now_local())
+        return
     for i in range(1, attempts + 1):
         try:
             seen, static_new = asyncio.run(listen_once(LISTEN_SECONDS))
@@ -392,9 +625,22 @@ async def run_daemon():
 
 
 def main():
-    if not API_KEY or "ВСТАВЬТЕ" in API_KEY:
+    if SOURCE == "gfw":
+        if not GFW_API_KEY:
+            sys.exit("Укажите ключ Global Fishing Watch: переменная окружения GFW_API_KEY.")
+        try:
+            run_gfw()
+        except Exception as e:
+            sys.exit(f"Не удалось получить данные: {e}")
+        return
+    if SOURCE == "mst":
+        if not MST_API_KEY:
+            sys.exit("Укажите ключ MyShipTracking: переменная окружения MST_API_KEY.")
+    elif not API_KEY or "ВСТАВЬТЕ" in API_KEY:
         sys.exit("Укажите ключ: переменная окружения AISSTREAM_API_KEY или API_KEY в скрипте.")
     if "--daemon" in sys.argv:
+        if SOURCE == "mst":
+            sys.exit("Непрерывный режим только для aisstream. Для MyShipTracking — запуск по расписанию.")
         asyncio.run(run_daemon())
     else:
         try:
