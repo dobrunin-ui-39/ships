@@ -4,7 +4,7 @@ name: Суда в зоне
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # время UTC; GitHub может задерживать запуск на 5-20 минут
+    - cron: "*/15 * * * *"   # время UTC; GitHub может задерживать запуск на 5-20 минут
   workflow_dispatch:          # кнопка ручного запуска во вкладке Actions
 
 permissions:
