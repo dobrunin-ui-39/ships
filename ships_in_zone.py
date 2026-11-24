@@ -35,6 +35,11 @@ API_KEY = os.environ.get("AISSTREAM_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_СЮД�
 # Калининградская область: от Балтийской косы до Куршской косы, с подходами.
 # Захватывает и небольшие приграничные польские воды у Балтийской косы.
 MAIN_AREA = [[54.35, 19.20], [55.30, 21.30]]
+# Для проверки можно временно задать другую область переменной окружения AREA,
+# например AREA="53.5,9.5,66,30.5" (вся Балтика) — широта1,долгота1,широта2,долгота2.
+if os.environ.get("AREA", "").strip():
+    _a = [float(x) for x in os.environ["AREA"].replace(" ", "").split(",")]
+    MAIN_AREA = [[_a[0], _a[1]], [_a[2], _a[3]]]
 
 # Подзоны для столбца «Зона». Проверяются сверху вниз, берётся первая подходящая.
 # Границы примерные — при необходимости поправьте.
@@ -212,6 +217,7 @@ def subscription():
 async def listen_once(seconds):
     import websockets  # pip install websockets
     seen, static_new = {}, {}
+    counts = {}
     loop = asyncio.get_running_loop()
     deadline = loop.time() + seconds
     async with websockets.connect(AIS_URL, open_timeout=60) as ws:
@@ -224,7 +230,10 @@ async def listen_once(seconds):
             msg = json.loads(raw)
             if "error" in msg:
                 raise RuntimeError(f"aisstream: {msg['error']}")
+            mt = msg.get("MessageType", "?")
+            counts[mt] = counts.get(mt, 0) + 1
             process_message(msg, seen, static_new)
+    log(f"Область {MAIN_AREA}: получено сообщений {sum(counts.values())} {counts or ''}")
     return seen, static_new
 
 
